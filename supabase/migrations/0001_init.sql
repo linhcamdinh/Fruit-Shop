@@ -1,4 +1,4 @@
--- Fruit Shop: initial schema (draft, not yet applied to any Supabase project)
+-- Fruit Shop: initial schema
 -- Money is stored as bigint in the currency's smallest unit (AUD cents, VND dong).
 
 -- ---------------------------------------------------------------------------
@@ -518,7 +518,7 @@ create policy own_invoices on public.invoices for select
   using (exists (select 1 from public.orders o where o.id = order_id and o.customer_id = public.my_customer_id()));
 create policy own_deliveries on public.deliveries for select
   using (exists (select 1 from public.orders o where o.id = order_id and o.customer_id = public.my_customer_id()));
--- Customer order placement goes through an Edge Function (step 2) so prices and stock are checked server-side.
+-- Customers place orders through place_customer_order (0002) so prices and stock are checked server-side.
 
 -- Drivers: their assigned deliveries only.
 create policy driver_deliveries on public.deliveries for select using (driver_id = auth.uid());
