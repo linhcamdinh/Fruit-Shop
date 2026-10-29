@@ -40,6 +40,7 @@ Drivers do not get a separate app. They sign in to the staff app on their phone 
 ### 5.1 Product catalog
 - Products have an English and a Vietnamese name and description, a photo, a category and a selling unit: per kg, per box, or each.
 - Each product has a price in AUD and/or VND, each with its own tax rate. A product without a price in a currency is not sold in that currency.
+- VND prices include a **logistics fee** per unit to cover getting the fruit to Vietnam, so they cost more than the AUD price. Customers see one combined price; the fee is stored separately so reports can show product sales and logistics income apart.
 - Products can be marked inactive (hidden from sale) without deleting history.
 - Starting products: cherries, apples, oranges. The full list is imported from the owner's spreadsheet.
 
@@ -134,10 +135,11 @@ Decided by the owner on 2026-10-29:
 4. Cash payments first; card payments later.
 5. No separate driver app; drivers use a driver view in the staff app.
 6. Delivery fee: most likely a flat fee, amounts to be discussed.
+7. Choosing Vietnamese shows VND prices at any shop. VND prices include a logistics fee, so they are higher.
 
 Still open:
 
 1. The flat delivery fee for each shop.
 2. Vietnamese VAT on fresh fruit (check with the accountant).
 3. The product spreadsheet (coming from the owner).
-4. Language and currency for a customer who wants Vietnamese text at the Australian shop: as agreed, they would see VND prices. Confirm this is wanted, or decouple currency from language for the POS app.
+4. The logistics fee per product (or per kg) for VND prices.

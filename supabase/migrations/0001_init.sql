@@ -118,10 +118,12 @@ create table public.products (
 
 -- A product is sold in a currency only if it has a price row for it.
 -- Tax lives here because AUD sales follow Australian rules and VND sales follow Vietnamese rules.
+-- Customers see one price per unit: unit_price + logistics_fee (used for VND to cover shipping to Vietnam).
 create table public.product_prices (
   product_id uuid not null references public.products (id) on delete cascade,
   currency public.currency_code not null,
   unit_price bigint not null check (unit_price >= 0),
+  logistics_fee bigint not null default 0 check (logistics_fee >= 0),
   tax_rate numeric(5, 4) not null default 0 check (tax_rate >= 0 and tax_rate < 1),
   primary key (product_id, currency)
 );
@@ -200,8 +202,9 @@ create table public.order_items (
   unit public.sell_unit not null,
   quantity numeric(12, 3) not null check (quantity > 0),
   unit_price bigint not null check (unit_price >= 0),
+  logistics_fee bigint not null default 0 check (logistics_fee >= 0),
   tax_rate numeric(5, 4) not null default 0,
-  line_total bigint generated always as (round(quantity * unit_price)::bigint) stored
+  line_total bigint generated always as (round(quantity * (unit_price + logistics_fee))::bigint) stored
 );
 
 create index on public.order_items (order_id);
@@ -414,12 +417,21 @@ cross join public.locations l
 left join public.stock_movements m on m.product_id = p.id and m.location_id = l.id
 group by p.id, l.id;
 
+-- Prices as customers see them.
+create view public.catalog_prices with (security_invoker = true) as
+select pp.product_id, pp.currency, pp.unit_price + pp.logistics_fee as display_price, pp.tax_rate
+from public.product_prices pp
+join public.products p on p.id = pp.product_id
+where p.is_active;
+
 -- AUD and VND are always reported separately.
 create view public.daily_sales with (security_invoker = true) as
-select date_trunc('day', confirmed_at)::date as day, location_id, currency,
-       count(*) as orders, sum(total) as revenue
-from public.orders
-where status not in ('draft', 'cancelled')
+select date_trunc('day', o.confirmed_at)::date as day, o.location_id, o.currency,
+       count(*) as orders, sum(o.total) as revenue,
+       sum((select coalesce(sum(round(i.quantity * i.logistics_fee)), 0)::bigint
+            from public.order_items i where i.order_id = o.id)) as logistics_revenue
+from public.orders o
+where o.status not in ('draft', 'cancelled')
 group by 1, 2, 3;
 
 -- Unpaid and overdue invoices, for chasing account customers.
