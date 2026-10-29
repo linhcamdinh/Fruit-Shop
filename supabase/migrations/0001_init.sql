@@ -15,6 +15,34 @@ create type public.invoice_status as enum ('unpaid', 'part_paid', 'paid', 'void'
 create type public.payment_method as enum ('cash', 'card_in_shop', 'card_online', 'bank_transfer');
 create type public.stock_reason as enum ('received', 'sold', 'wasted', 'adjusted', 'returned');
 create type public.delivery_status as enum ('pending', 'assigned', 'out_for_delivery', 'delivered', 'failed');
+create type public.payment_terms as enum ('pay_now', 'pay_on_delivery', 'on_account');
+
+-- Currency follows language: English shows AUD, Vietnamese shows VND.
+create function public.currency_for_lang(p_lang public.lang_code) returns public.currency_code
+language sql immutable as $$
+  select case p_lang when 'vi' then 'VND'::public.currency_code else 'AUD'::public.currency_code end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Shops
+-- ---------------------------------------------------------------------------
+
+create table public.locations (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  country text not null check (country in ('AU', 'VN')),
+  address text,
+  phone text,
+  is_active boolean not null default true
+);
+
+-- Flat delivery fee per shop and currency. Amounts to be confirmed by the owner.
+create table public.delivery_fees (
+  location_id uuid not null references public.locations (id) on delete cascade,
+  currency public.currency_code not null,
+  flat_fee bigint not null default 0 check (flat_fee >= 0),
+  primary key (location_id, currency)
+);
 
 -- ---------------------------------------------------------------------------
 -- People
@@ -27,6 +55,7 @@ create table public.profiles (
   full_name text not null default '',
   phone text,
   preferred_lang public.lang_code not null default 'en',
+  location_id uuid references public.locations (id) on delete set null,  -- staff member's home shop
   created_at timestamptz not null default now()
 );
 
@@ -35,10 +64,14 @@ create table public.customers (
   id uuid primary key default gen_random_uuid(),
   profile_id uuid unique references public.profiles (id) on delete set null,
   full_name text not null,
+  business_name text,
+  business_tax_id text,                  -- ABN in Australia, MST in Vietnam
   phone text,
   email text,
   preferred_lang public.lang_code not null default 'en',
-  preferred_currency public.currency_code not null default 'AUD',
+  -- Set for regular business customers allowed to buy on account; null = must pay now or on delivery.
+  account_terms_days int check (account_terms_days > 0),
+  credit_limit bigint check (credit_limit >= 0),
   notes text,
   created_at timestamptz not null default now()
 );
@@ -78,17 +111,18 @@ create table public.products (
   description_vi text,
   image_path text,                       -- Supabase Storage path
   unit public.sell_unit not null default 'kg',
-  tax_rate numeric(5, 4) not null default 0 check (tax_rate >= 0 and tax_rate < 1),
   low_stock_level numeric(12, 3) not null default 0,
   is_active boolean not null default true,
   created_at timestamptz not null default now()
 );
 
 -- A product is sold in a currency only if it has a price row for it.
+-- Tax lives here because AUD sales follow Australian rules and VND sales follow Vietnamese rules.
 create table public.product_prices (
   product_id uuid not null references public.products (id) on delete cascade,
   currency public.currency_code not null,
   unit_price bigint not null check (unit_price >= 0),
+  tax_rate numeric(5, 4) not null default 0 check (tax_rate >= 0 and tax_rate < 1),
   primary key (product_id, currency)
 );
 
@@ -99,16 +133,18 @@ create table public.product_prices (
 create table public.stock_batches (
   id uuid primary key default gen_random_uuid(),
   product_id uuid not null references public.products (id) on delete cascade,
+  location_id uuid not null references public.locations (id),
   received_at timestamptz not null default now(),
   best_before date,
   supplier text,
   notes text
 );
 
--- Ledger: current stock is the sum of quantity per product. Positive = in, negative = out.
+-- Ledger: current stock is the sum of quantity per product and shop. Positive = in, negative = out.
 create table public.stock_movements (
   id bigint generated always as identity primary key,
   product_id uuid not null references public.products (id) on delete cascade,
+  location_id uuid not null references public.locations (id),
   batch_id uuid references public.stock_batches (id) on delete set null,
   order_id uuid,                         -- FK added after orders exists
   reason public.stock_reason not null,
@@ -118,7 +154,7 @@ create table public.stock_movements (
   note text
 );
 
-create index on public.stock_movements (product_id);
+create index on public.stock_movements (product_id, location_id);
 
 -- ---------------------------------------------------------------------------
 -- Orders
@@ -129,10 +165,12 @@ create sequence public.order_number_seq start 1001;
 create table public.orders (
   id uuid primary key default gen_random_uuid(),
   order_number bigint not null unique default nextval('public.order_number_seq'),
+  location_id uuid not null references public.locations (id),
   customer_id uuid references public.customers (id) on delete set null,  -- null = walk-in
-  currency public.currency_code not null,
+  currency public.currency_code not null,  -- from the language in use: see currency_for_lang
   status public.order_status not null default 'draft',
   fulfilment public.fulfilment_type not null default 'pickup',
+  payment_terms public.payment_terms not null default 'pay_now',
   delivery_address_id uuid references public.customer_addresses (id) on delete set null,
   subtotal bigint not null default 0,
   tax_total bigint not null default 0,
@@ -141,11 +179,12 @@ create table public.orders (
   notes text,
   created_by uuid references public.profiles (id),
   created_at timestamptz not null default now(),
-  confirmed_at timestamptz
+  confirmed_at timestamptz,
+  check (payment_terms <> 'on_account' or customer_id is not null)
 );
 
 create index on public.orders (customer_id);
-create index on public.orders (created_at);
+create index on public.orders (location_id, created_at);
 
 alter table public.stock_movements
   add constraint stock_movements_order_fk
@@ -270,18 +309,42 @@ create trigger orders_fee_recalc
 after update of delivery_fee on public.orders
 for each row execute function public.orders_fee_changed();
 
+-- Delivery orders pick up the shop's flat fee unless staff set one.
+create function public.orders_default_fee() returns trigger
+language plpgsql as $$
+begin
+  if new.fulfilment = 'delivery' and new.delivery_fee = 0 then
+    select flat_fee into new.delivery_fee
+    from public.delivery_fees
+    where location_id = new.location_id and currency = new.currency;
+    new.delivery_fee := coalesce(new.delivery_fee, 0);
+  end if;
+  return new;
+end;
+$$;
+
+create trigger orders_fee_default
+before insert on public.orders
+for each row execute function public.orders_default_fee();
+
 -- Deduct stock when an order is confirmed; put it back if a confirmed order is cancelled.
+-- On-account orders are only allowed for customers with account terms.
 create function public.orders_status_changed() returns trigger
 language plpgsql as $$
 begin
   if new.status = 'confirmed' and old.status = 'draft' then
+    if new.payment_terms = 'on_account' and not exists (
+      select 1 from public.customers where id = new.customer_id and account_terms_days is not null
+    ) then
+      raise exception 'Customer is not set up for invoice on account';
+    end if;
     new.confirmed_at := now();
-    insert into public.stock_movements (product_id, order_id, reason, quantity, created_by)
-    select product_id, new.id, 'sold', -quantity, auth.uid()
+    insert into public.stock_movements (product_id, location_id, order_id, reason, quantity, created_by)
+    select product_id, new.location_id, new.id, 'sold', -quantity, auth.uid()
     from public.order_items where order_id = new.id;
   elsif new.status = 'cancelled' and old.status not in ('draft', 'cancelled') then
-    insert into public.stock_movements (product_id, order_id, reason, quantity, created_by)
-    select product_id, new.id, 'returned', quantity, auth.uid()
+    insert into public.stock_movements (product_id, location_id, order_id, reason, quantity, created_by)
+    select product_id, new.location_id, new.id, 'returned', quantity, auth.uid()
     from public.order_items where order_id = new.id;
   end if;
   return new;
@@ -291,6 +354,26 @@ $$;
 create trigger orders_stock
 before update of status on public.orders
 for each row execute function public.orders_status_changed();
+
+-- Invoice due date: on-account orders get the customer's terms, everything else is due on issue.
+create function public.invoices_set_due() returns trigger
+language plpgsql as $$
+begin
+  if new.due_at is null then
+    select new.issued_at::date + case when o.payment_terms = 'on_account'
+                                      then coalesce(c.account_terms_days, 0) else 0 end
+    into new.due_at
+    from public.orders o
+    left join public.customers c on c.id = o.customer_id
+    where o.id = new.order_id;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger invoices_due
+before insert on public.invoices
+for each row execute function public.invoices_set_due();
 
 -- Keep invoice status in step with payments.
 create function public.payments_changed() returns trigger
@@ -322,20 +405,31 @@ for each row execute function public.payments_changed();
 -- ---------------------------------------------------------------------------
 
 create view public.stock_levels with (security_invoker = true) as
-select p.id as product_id, p.name_en, p.name_vi, p.unit,
+select p.id as product_id, l.id as location_id, l.name as location_name,
+       p.name_en, p.name_vi, p.unit,
        coalesce(sum(m.quantity), 0) as on_hand,
        coalesce(sum(m.quantity), 0) <= p.low_stock_level as is_low
 from public.products p
-left join public.stock_movements m on m.product_id = p.id
-group by p.id;
+cross join public.locations l
+left join public.stock_movements m on m.product_id = p.id and m.location_id = l.id
+group by p.id, l.id;
 
 -- AUD and VND are always reported separately.
 create view public.daily_sales with (security_invoker = true) as
-select date_trunc('day', confirmed_at)::date as day, currency,
+select date_trunc('day', confirmed_at)::date as day, location_id, currency,
        count(*) as orders, sum(total) as revenue
 from public.orders
 where status not in ('draft', 'cancelled')
-group by 1, 2;
+group by 1, 2, 3;
+
+-- Unpaid and overdue invoices, for chasing account customers.
+create view public.receivables with (security_invoker = true) as
+select i.id as invoice_id, i.invoice_number, o.location_id, o.customer_id, i.currency, i.total,
+       i.total - coalesce((select sum(amount) from public.payments p where p.invoice_id = i.id), 0) as balance,
+       i.due_at, i.due_at < current_date as is_overdue
+from public.invoices i
+join public.orders o on o.id = i.order_id
+where i.status in ('unpaid', 'part_paid');
 
 -- ---------------------------------------------------------------------------
 -- Row level security
@@ -356,6 +450,8 @@ language sql stable security definer set search_path = '' as $$
   select id from public.customers where profile_id = auth.uid();
 $$;
 
+alter table public.locations enable row level security;
+alter table public.delivery_fees enable row level security;
 alter table public.profiles enable row level security;
 alter table public.customers enable row level security;
 alter table public.customer_addresses enable row level security;
@@ -372,6 +468,8 @@ alter table public.deliveries enable row level security;
 alter table public.delivery_events enable row level security;
 
 -- Staff and owner: full access to business data.
+create policy staff_all on public.locations for all using (public.is_staff()) with check (public.is_staff());
+create policy staff_all on public.delivery_fees for all using (public.is_staff()) with check (public.is_staff());
 create policy staff_all on public.customers for all using (public.is_staff()) with check (public.is_staff());
 create policy staff_all on public.customer_addresses for all using (public.is_staff()) with check (public.is_staff());
 create policy staff_all on public.categories for all using (public.is_staff()) with check (public.is_staff());
@@ -391,6 +489,8 @@ create policy own_profile on public.profiles for select using (id = auth.uid() o
 create policy owner_manage on public.profiles for all using (public.my_role() = 'owner') with check (public.my_role() = 'owner');
 
 -- Public catalog: anyone (including logged-out visitors) can read active products.
+create policy read_catalog on public.locations for select using (is_active);
+create policy read_catalog on public.delivery_fees for select using (true);
 create policy read_catalog on public.categories for select using (true);
 create policy read_catalog on public.products for select using (is_active);
 create policy read_catalog on public.product_prices for select using (true);
